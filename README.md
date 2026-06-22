@@ -1,5 +1,5 @@
 <div align="center">
-<h3> MindDrive: A Vision-Language-Action Model for Autonomous Driving Utilizing Language as Action in Online Reinforcement Learning </h3>
+<h3> [🎉ECCV 26] MindDrive: A Vision-Language-Action Model for Autonomous Driving Utilizing Language as Action in Online Reinforcement Learning </h3>
 
 Haoyu Fu<sup>1\*</sup>, Diankun Zhang<sup>2\*</sup>, Zongchuang Zhao<sup>1</sup>, <br>Jianfeng Cui<sup>2</sup>, Hongwei Xie<sup>2†</sup>,  Bing Wang<sup>2</sup>, Guang Chen<sup>2</sup>, Dingkang Liang<sup>1†</sup>, Xiang Bai<sup>1</sup>
 
@@ -23,6 +23,7 @@ Current Vision-Language-Action (VLA) paradigms in autonomous driving primarily r
 </div>
 
 ## News
+`[2026/06/20]` Mindrive is accepted by ECCV 2026🎉🎉🎉!
 
 `[2026/03/19]` We are launching the MindDrive 3B model, which achieves 80.59 DS and 55.09 SR. Code and weights are now available.
 
