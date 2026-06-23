@@ -2,7 +2,7 @@
 # ================= Config =================
 BASE_PORT=30000
 BASE_TM_PORT=50000
-BASE_ROUTES=data/test_opensource_routes/rollout_routes
+BASE_ROUTES=data/routes/rollout_routes
 CONFIG=adzoo/minddrive/configs/minddrive_qwen2_05B_lora_rollout.py
 PLANNER_TYPE=traj
 ALGO=minddrive_collect_ma_stage3

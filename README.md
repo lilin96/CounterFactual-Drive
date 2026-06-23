@@ -128,11 +128,11 @@ This project uses the following external resources:
 If this work is helpful for your research, please consider citing:
 
 ```
-@article{fu2025minddrive,
+@inproceedings{fu2025minddrive,
   title={MindDrive: A Vision-Language-Action Model for Autonomous Driving via Online Reinforcement Learning},
-  author={Haoyu Fu and Diankun Zhang and Zongchuang Zhao and Jianfeng Cui and Hongwei Xie and Bing Wang and Guang Chen and Dingkang Liang and Xiang Bai},
-  journal={arXiv Preprint arXiv:2512.13636},  
-  year={2025},
+  author={Fu, Haoyu and Zhang, Diankun and Zhao, Zongchuang and Cui, Jianfeng and Xie, Hongwei and Wang, Bing and Chen, Guang and Liang, Dingkang and Bai, Xiang},
+  booktitle={Proceedings of the European Conference on Computer Vision},
+  year={2026}
 }
 ```
 ```
