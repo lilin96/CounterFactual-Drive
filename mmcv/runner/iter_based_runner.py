@@ -23,7 +23,7 @@ import cv2
 import os
 from tabulate import tabulate
 
-from team_code.carla_env.carla_env_scenario import CarlaScenarioEnv, TickRuntimeError
+# from team_code.carla_env.carla_env_scenario import CarlaScenarioEnv, TickRuntimeError
 
 from mmcv.parallel.collate import collate as mm_collate_to_batch_form
 import copy
@@ -411,6 +411,7 @@ class RLIterBasedRunner(BaseRunner):
         self.model.eval()
         self.mode = 'rollout'
         self.call_hook('before_val_iter')
+        from team_code.carla_env.carla_env_scenario import CarlaScenarioEnv, TickRuntimeError
         env = CarlaScenarioEnv(routes =args.routes,repetitions=args.repetitions,port=args.port, traffic_manager_port=args.traffic_manager_port,checkpoint=args.checkpoint, resume = args.resume)
         PENALTY_CONFIG= None
         if hasattr(args,'PENALTY_CONFIG'):

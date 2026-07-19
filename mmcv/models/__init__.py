@@ -7,6 +7,7 @@ from .builder import (BACKBONES, DETECTORS, HEADS, LOSSES, NECKS,
                       build_model, build_neck, build_roi_extractor, 
                       build_shared_head, build_voxel_encoder, build_segmentor)
 from .dense_heads import *  # noqa: F401,F403
+from .counterfactual import *  # noqa: F401,F403
 from .detectors import *  # noqa: F401,F403
 from .losses import *  # noqa: F401,F403
 from .necks import *  # noqa: F401,F403

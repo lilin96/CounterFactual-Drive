@@ -30,6 +30,7 @@ from pyquaternion import Quaternion
 from scipy.optimize import fsolve
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 IS_BENCH2DRIVE = os.environ.get('IS_BENCH2DRIVE', None)
+USE_COUNTERFACTUAL_TRAJ = os.environ.get('USE_COUNTERFACTUAL_TRAJ', '0') == '1'
 
 def get_entry_point():
     return 'MinddriveAgent'
@@ -405,8 +406,16 @@ class MinddriveAgent(autonomous_agent.AutonomousAgent):
                     
         custom_wrap_fp16_model(self.model)
         output_data_batch = self.model(input_data_batch, return_loss=False)
-        out_truck = output_data_batch[0]['pts_bbox']['ego_fut_preds'].cpu().numpy()
-        out_truck_path = output_data_batch[0]['pts_bbox']['pw_ego_fut_pred'].cpu().numpy()
+        pts_output = output_data_batch[0]['pts_bbox']
+        out_truck = pts_output['ego_fut_preds'].cpu().numpy()
+        cf_used = False
+        if USE_COUNTERFACTUAL_TRAJ and 'cf_selected_ego_future' in pts_output:
+            cf_traj = pts_output['cf_selected_ego_future']
+            if torch.is_tensor(cf_traj):
+                cf_traj = cf_traj.detach().cpu().numpy()
+            out_truck = np.squeeze(cf_traj)
+            cf_used = True
+        out_truck_path = pts_output['pw_ego_fut_pred'].cpu().numpy()
         steer_traj, throttle_traj, brake_traj, metadata_traj = self.pidcontroller.control_pid(out_truck_path,out_truck, tick_data['speed'], local_command_xy)
         if brake_traj < 0.05: brake_traj = 0.0
         if throttle_traj > brake_traj: brake_traj = 0.0
@@ -415,6 +424,9 @@ class MinddriveAgent(autonomous_agent.AutonomousAgent):
         control = carla.VehicleControl()
         self.pid_metadata = metadata_traj
         self.pid_metadata['agent'] = 'only_traj'
+        self.pid_metadata['cf_used'] = cf_used
+        if cf_used:
+            self.pid_metadata['cf_selected_meta_action'] = pts_output.get('cf_selected_meta_action', None)
         control.steer = np.clip(float(steer_traj), -1, 1)
         control.throttle = np.clip(float(throttle_traj), 0, 0.75)
         control.brake = np.clip(float(brake_traj), 0, 1)

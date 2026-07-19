@@ -161,6 +161,8 @@ class Minddrive(MVXTwoStageDetector):
                  temporal_prompt_input=False,
                  rl_training = False,
                  mix_qa_training=False,
+                 counterfactual_head=None,
+                 counterfactual_train_only=False,
                  open_loop_infer=True):
         super(Minddrive, self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
@@ -195,6 +197,8 @@ class Minddrive(MVXTwoStageDetector):
         self.pts_bbox_head.time_embedding = self.time_embedding
         self.pts_bbox_head.ego_pose_pe = self.ego_pose_pe
         self.open_loop_infer = open_loop_infer
+        self.counterfactual_head = builder.build_head(counterfactual_head) if counterfactual_head is not None else None
+        self.counterfactual_train_only = counterfactual_train_only
         if map_head is not None:
             self.map_head = builder.build_head(map_head)
             self.map_head.query_pos = self.query_pos
@@ -423,6 +427,12 @@ class Minddrive(MVXTwoStageDetector):
 
         self.freeze_backbone = freeze_backbone
         self.temporal_prompt_input = temporal_prompt_input
+        if self.counterfactual_train_only:
+            self._set_counterfactual_trainable_only()
+
+    def _set_counterfactual_trainable_only(self):
+        for name, param in self.named_parameters():
+            param.requires_grad = name.startswith("counterfactual_head.")
 
     def train(self, mode, *args, **kwargs):
         super().train(mode, *args, **kwargs)
@@ -435,6 +445,8 @@ class Minddrive(MVXTwoStageDetector):
                     shared_module = getattr(shared_module, item)
                 freeze_module(shared_module)
                 print(f'Freeze: {shared_module_name}')
+        if mode and self.counterfactual_train_only:
+            self._set_counterfactual_trainable_only()
         return self
 
     @property
@@ -585,7 +597,8 @@ class Minddrive(MVXTwoStageDetector):
                 import pickle
                 with open('lane_pts.pkl', 'wb') as file:
                     pickle.dump(lane_pts, file)
-            losses.update(self.map_head.loss(*loss_inputs))
+            if not self.counterfactual_train_only:
+                losses.update(self.map_head.loss(*loss_inputs))
 
         if self.with_pts_bbox:
             outs_bbox, det_query = self.pts_bbox_head(img_metas, pos_embed, outs_lane, **data)
@@ -594,14 +607,33 @@ class Minddrive(MVXTwoStageDetector):
             if self.pts_bbox_head.pred_traffic_light_state:
                 loss_inputs.append(data['traffic_state'])
                 loss_inputs.append(data['traffic_state_mask'])
-            if self.use_col_loss:
-                loss, agent_outs = self.pts_bbox_head.loss(*loss_inputs)
-            else:
-                loss = self.pts_bbox_head.loss(*loss_inputs)
-            losses.update(loss)
+            if not self.counterfactual_train_only:
+                if self.use_col_loss:
+                    loss, agent_outs = self.pts_bbox_head.loss(*loss_inputs)
+                else:
+                    loss = self.pts_bbox_head.loss(*loss_inputs)
+                losses.update(loss)
+
+        if self.counterfactual_head is not None and "vision_embeded_obj" in locals() and "vision_embeded_map" in locals():
+            scene_tokens = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1)
+            cf_data = data.copy()
+            cf_data.pop("ego_fut_masks", None)
+            cf_losses = self.counterfactual_head.forward_train(
+                scene_tokens=scene_tokens,
+                outs_bbox=outs_bbox,
+                outs_lane=outs_lane,
+                gt_bboxes_3d=gt_bboxes_3d,
+                gt_labels_3d=gt_labels_3d,
+                gt_attr_labels=gt_attr_labels,
+                ego_fut_trajs=ego_fut_trajs,
+                ego_fut_masks=data.get("ego_fut_masks", None),
+                img_metas=img_metas,
+                **cf_data
+            )
+            losses.update(cf_losses)
         
 
-        if self.with_lm_head:
+        if self.with_lm_head and not self.counterfactual_train_only:
             if self.use_gen_token:
                 vision_embeded = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1) 
                 vlm_loss, ego_feature = self.lm_head(input_ids=input_ids, attention_mask=vlm_attn_mask, labels=vlm_labels, images=vision_embeded, use_cache=False, return_ego_feature=True)
@@ -823,7 +855,7 @@ class Minddrive(MVXTwoStageDetector):
         if self.test_flag: #for interval evaluation
             self.pts_bbox_head.reset_memory()
             self.test_flag = False
-        if self.tokenizer is not None:
+        if self.tokenizer is not None and not self.counterfactual_train_only:
             input_ids = torch.nn.utils.rnn.pad_sequence(
                 input_ids, # [(76,)]
                 batch_first=True,
@@ -1257,6 +1289,29 @@ class Minddrive(MVXTwoStageDetector):
                             waypoint=None, waypoint_inactive=None, bbox_result=bbox_list, 
                             lane_result=lane_results, metric_dict=None, use_gt=False, show_dir=show_dir, generated_text=generated_text)
                         lane_results[0]['ss'] = dict(img_to_show=img_to_show, img_bev=img_bev, qa_img=qa_img)
+
+        if self.counterfactual_head is not None and lane_results is not None and len(bbox_results) > 0 and "vision_embeded_obj" in locals() and "vision_embeded_map" in locals():
+            scene_tokens = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1)
+            cf_output = self.counterfactual_head.forward_infer(
+                scene_tokens=scene_tokens,
+                bbox_result=bbox_results[0],
+                lane_results=lane_results,
+                ego_candidates=None,
+                candidate_meta_actions=None,
+                map_context=lane_results,
+            )
+            lane_results[0]["cf_selected_ego_future"] = cf_output["selected_ego_future"]
+            lane_results[0]["cf_selected_meta_action"] = cf_output["selected_meta_action"]
+            lane_results[0]["cf_risk_scores"] = cf_output["risk_scores"]
+            lane_results[0]["cf_counterfactual_scenes"] = cf_output["counterfactual_scenes"]
+            lane_results[0]["cf_interaction_relevance"] = cf_output["interaction_relevance"]
+            lane_results[0]["cf_response_meta_actions"] = cf_output["response_meta_actions"]
+            bbox_results[0]["cf_selected_ego_future"] = cf_output["selected_ego_future"]
+            bbox_results[0]["cf_selected_meta_action"] = cf_output["selected_meta_action"]
+            bbox_results[0]["cf_risk_scores"] = cf_output["risk_scores"]
+            bbox_results[0]["cf_counterfactual_scenes"] = cf_output["counterfactual_scenes"]
+            bbox_results[0]["cf_interaction_relevance"] = cf_output["interaction_relevance"]
+            bbox_results[0]["cf_response_meta_actions"] = cf_output["response_meta_actions"]
 
         return bbox_results, generated_text, lane_results, metric_dict
     

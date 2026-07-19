@@ -7,7 +7,8 @@ import argparse
 import os
 import torch
 import warnings
-from mmcv.utils import get_dist_info, init_dist, wrap_fp16_model, set_random_seed, Config, DictAction, load_checkpoint
+from mmcv.utils import get_dist_info, init_dist, wrap_fp16_model, set_random_seed, Config, DictAction, load_checkpoint, mkdir_or_exist
+from mmcv.fileio.io import dump
 from mmcv.models import build_model, fuse_conv_bn
 from torch.nn import DataParallel
 from torch.nn.parallel.distributed import DistributedDataParallel
@@ -215,6 +216,10 @@ def main():
     if rank == 0:
         if args.out:
             print(f'\nwriting results to {args.out}')
+            out_dir = osp.dirname(args.out)
+            if out_dir:
+                mkdir_or_exist(out_dir)
+            dump(outputs, args.out)
         kwargs = {} if args.eval_options is None else args.eval_options
         kwargs['jsonfile_prefix'] = osp.join('test', args.config.split(
             '/')[-1].split('.')[-2], time.ctime().replace(' ', '_').replace(':', '_'))
