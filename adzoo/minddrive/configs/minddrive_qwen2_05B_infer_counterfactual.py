@@ -14,6 +14,6 @@ model = dict(
         speed_loss_weight=1.0,
         path_loss_weight=1.0,
         real_loss_weight=0.0,
+        save_counterfactual_scenes=False,
     )
 )
-

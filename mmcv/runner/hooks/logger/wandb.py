@@ -53,7 +53,10 @@ class WandbLoggerHook(LoggerHook):
         init_kwargs = {k: v for k, v in init_kwargs.items() if v is not None}
         if self.log_config and hasattr(runner, "meta") and runner.meta is not None:
             config = runner.meta.get("config", None)
-            if config is not None:
+            # wandb treats string config values as a path to a config file.
+            # MindDrive stores cfg.pretty_text in runner.meta["config"], so only
+            # pass structured configs here.
+            if isinstance(config, dict):
                 init_kwargs["config"] = config
         self.wandb.init(**init_kwargs)
 

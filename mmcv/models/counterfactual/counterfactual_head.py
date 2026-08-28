@@ -33,23 +33,55 @@ class CounterfactualReasoningHead(nn.Module):
         hidden_dims=256,
         future_steps=6,
         relevance_threshold=0.5,
+        agent_score_threshold=0.25,
+        valid_agent_labels=(0, 1, 2, 3, 7, 8),
+        min_valid_future_steps=2,
         rel_loss_weight=1.0,
         speed_loss_weight=1.0,
         path_loss_weight=1.0,
         real_loss_weight=0.0,
+        save_counterfactual_scenes=True,
+        use_ego_meta_embedding=False,
+        train_candidate_augmentation=False,
+        aug_num_candidates=4,
+        aug_loss_weight=0.5,
+        aug_response_loss_weight=0.25,
+        use_candidate_conditioned_agent_response=True,
+        rule_candidate_mode="all",
+        rule_fixed_path_idx=1,
     ):
         super().__init__()
         self.future_steps = future_steps
         self.relevance_threshold = relevance_threshold
+        self.agent_score_threshold = agent_score_threshold
+        self.valid_agent_labels = tuple(int(x) for x in valid_agent_labels) if valid_agent_labels is not None else None
+        self.min_valid_future_steps = int(min_valid_future_steps)
         self.rel_loss_weight = rel_loss_weight
         self.speed_loss_weight = speed_loss_weight
         self.path_loss_weight = path_loss_weight
         self.real_loss_weight = real_loss_weight
-        self.graph = MetaActionInteractionGraph(embed_dims, hidden_dims, future_steps)
+        self.save_counterfactual_scenes = save_counterfactual_scenes
+        self.use_ego_meta_embedding = use_ego_meta_embedding
+        self.train_candidate_augmentation = train_candidate_augmentation
+        self.aug_num_candidates = aug_num_candidates
+        self.aug_loss_weight = aug_loss_weight
+        self.aug_response_loss_weight = aug_response_loss_weight
+        self.use_candidate_conditioned_agent_response = bool(use_candidate_conditioned_agent_response)
+        self.rule_candidate_mode = rule_candidate_mode
+        self.graph = MetaActionInteractionGraph(
+            embed_dims,
+            hidden_dims,
+            future_steps,
+            use_ego_meta_embedding=use_ego_meta_embedding,
+        )
         self.predictor = ResponsePredictor(hidden_dims)
         self.realizer = RuleBasedTrajectoryRealizer()
         self.risk_scorer = RuleBasedRiskScorer()
-        self.ego_generator = EgoCandidateGenerator(future_steps)
+        self.ego_generator = EgoCandidateGenerator(
+            future_steps,
+            candidate_mode=rule_candidate_mode,
+            fixed_path_idx=rule_fixed_path_idx,
+        )
 
     def _ensure_batched_futures(self, futures, batch_size=None, device=None):
         if futures is None:
@@ -113,6 +145,43 @@ class CounterfactualReasoningHead(nn.Module):
             centers = torch.cat([centers, pad], dim=1)
         return centers[:, :num_agents]
 
+    def _extract_agent_valid_mask(self, bbox_result, num_agents, device, batch_size):
+        """Return the detection-confidence mask aligned with agent futures."""
+        if num_agents == 0:
+            return torch.zeros(batch_size, 0, device=device, dtype=torch.bool)
+        scores = bbox_result.get("scores_3d", None) if bbox_result is not None else None
+        if scores is None:
+            return torch.ones(batch_size, num_agents, device=device, dtype=torch.bool)
+        if isinstance(scores, (list, tuple)):
+            scores = torch.stack([torch.as_tensor(x, device=device) for x in scores], dim=0)
+        else:
+            scores = torch.as_tensor(scores, device=device)
+        if scores.dim() == 1:
+            scores = scores.unsqueeze(0)
+        scores = scores.reshape(scores.shape[0], -1)
+        if scores.shape[0] == 1 and batch_size > 1:
+            scores = scores.expand(batch_size, -1)
+        if scores.shape[1] < num_agents:
+            pad = scores.new_full((scores.shape[0], num_agents - scores.shape[1]), float("-inf"))
+            scores = torch.cat([scores, pad], dim=1)
+        valid = scores[:batch_size, :num_agents] >= self.agent_score_threshold
+        labels = bbox_result.get("labels_3d", None) if bbox_result is not None else None
+        if labels is not None and self.valid_agent_labels is not None:
+            labels = torch.as_tensor(labels, device=device)
+            if labels.dim() == 1:
+                labels = labels.unsqueeze(0)
+            labels = labels.reshape(labels.shape[0], -1)
+            if labels.shape[0] == 1 and batch_size > 1:
+                labels = labels.expand(batch_size, -1)
+            if labels.shape[1] < num_agents:
+                pad = labels.new_full((labels.shape[0], num_agents - labels.shape[1]), -1)
+                labels = torch.cat([labels, pad], dim=1)
+            valid_label = torch.zeros_like(valid)
+            for label in self.valid_agent_labels:
+                valid_label |= labels[:batch_size, :num_agents] == label
+            valid &= valid_label
+        return valid
+
     def _extract_base_agent_futures(self, outs_bbox=None, bbox_result=None, boxes=None, device=None, batch_size=1):
         if bbox_result is not None and "trajs_3d" in bbox_result:
             trajs = bbox_result["trajs_3d"]
@@ -173,6 +242,48 @@ class CounterfactualReasoningHead(nn.Module):
         ego = ego[:, : self.future_steps].cumsum(dim=-2)
         return ego
 
+    def _meta_tensor_from_actions(self, candidate_meta_actions, num_candidates, batch_size, device):
+        meta = torch.zeros(num_candidates, 2, device=device, dtype=torch.long)
+        if candidate_meta_actions is not None:
+            for idx, action in enumerate(candidate_meta_actions[:num_candidates]):
+                if isinstance(action, dict):
+                    meta[idx, 0] = int(action.get("speed_idx", 0))
+                    meta[idx, 1] = int(action.get("path_idx", 0))
+        return meta[:, None, :].expand(num_candidates, batch_size, 2).reshape(num_candidates * batch_size, 2)
+
+    def _factual_meta_ids(self, ego_future):
+        speed = speed_pseudo_labels(ego_future)
+        path = path_pseudo_labels(ego_future)
+        return torch.stack([speed, path], dim=-1).long()
+
+    def _build_augmented_ego_candidates(self, ego_gt):
+        """Create candidate ego futures for factual augmentation.
+
+        These are not treated as counterfactual ground truth. They only provide
+        alternate ego conditions so geometric interaction relevance can be
+        recomputed from logged agent futures during training.
+        """
+        b, t, _ = ego_gt.shape
+        device = ego_gt.device
+        dtype = ego_gt.dtype
+        speed_ids = torch.tensor([1, 2, 3, 4, 6, 5, 0], device=device, dtype=torch.long)[: self.aug_num_candidates]
+        path_ids = torch.tensor([0, 1, 0, 0, 0, 1, 0], device=device, dtype=torch.long)[: self.aug_num_candidates]
+
+        deltas = ego_gt.diff(dim=-2, prepend=torch.zeros_like(ego_gt[:, :1]))
+        speed_scale_values = ego_gt.new_tensor([1.0, 0.05, 0.65, 1.25, 0.8, 1.1, 0.45])
+        lat_bias_values = ego_gt.new_tensor([0.0, 0.0, 0.18, 0.35, -0.18, -0.35])
+        time = torch.linspace(0.0, 1.0, t, device=device, dtype=dtype)
+
+        candidates = []
+        for speed_id, path_id in zip(speed_ids.tolist(), path_ids.tolist()):
+            adjusted = deltas * speed_scale_values[speed_id]
+            adjusted = adjusted.clone()
+            adjusted[..., 0] = adjusted[..., 0] + lat_bias_values[path_id] * time
+            candidates.append(adjusted.cumsum(dim=-2))
+        ego_aug = torch.stack(candidates, dim=1) if candidates else ego_gt[:, None]
+        meta = torch.stack([speed_ids, path_ids], dim=-1)
+        return ego_aug, meta
+
     def forward_train(
         self,
         scene_tokens,
@@ -191,56 +302,163 @@ class CounterfactualReasoningHead(nn.Module):
         ego_gt = self._extract_ego_future(ego_fut_trajs, device, batch_size)
         dtype = scene_tokens.dtype
         ego_gt = ego_gt.to(dtype=dtype)
-        agent_gt = self._extract_gt_agent_futures(gt_attr_labels, device, batch_size).to(dtype=dtype)
-        boxes = None
-        if gt_bboxes_3d is not None:
-            box_samples = []
-            max_agents = agent_gt.shape[1]
-            for boxes_3d in gt_bboxes_3d:
-                box = self._extract_bbox_tensor(boxes_3d, device, 1).squeeze(0).to(dtype=dtype)
-                if box.shape[-1] < 4:
-                    box = torch.cat([box, box.new_zeros((box.shape[0], 4 - box.shape[-1]))], dim=-1)
-                box = box[:, :4]
-                if box.shape[0] < max_agents:
-                    box = torch.cat([box, box.new_zeros((max_agents - box.shape[0], 4))], dim=0)
-                box_samples.append(box[:max_agents])
-            boxes = torch.stack(box_samples, dim=0) if box_samples else None
+        attr_samples = list(gt_attr_labels) if isinstance(gt_attr_labels, (list, tuple)) else list(gt_attr_labels)
+        label_samples = list(gt_labels_3d) if isinstance(gt_labels_3d, (list, tuple)) else list(gt_labels_3d)
+        box_samples = list(gt_bboxes_3d) if isinstance(gt_bboxes_3d, (list, tuple)) else list(gt_bboxes_3d)
 
-        agent_origins = self._box_centers_for_agents(boxes, agent_gt.shape[1], device, dtype) if boxes is not None else None
-        agent_gt_abs = agent_gt + agent_origins[..., None, :] if agent_origins is not None else agent_gt
+        # A rank can receive a scene with no valid dynamic agents.  In that
+        # case every reported loss must still be connected to the trainable
+        # counterfactual parameters, otherwise distributed backward fails
+        # with "does not require grad" on that rank.  Touch all trainable
+        # parameters with a zero coefficient so DDP also gets zero gradients
+        # for them and stays synchronized with ranks that do have valid agents.
+        zero = scene_tokens.new_zeros(())
+        for parameter in self.parameters():
+            if parameter.requires_grad:
+                zero = zero + parameter.sum() * 0.0
+        rel_sum = zero
+        speed_sum = zero
+        path_sum = zero
+        real_sum = zero
+        factual_count = 0
+        real_value_count = 0
+        aug_rel_sum = zero
+        aug_speed_sum = zero
+        aug_path_sum = zero
+        aug_count = 0
 
-        if agent_gt_abs.shape[1] == 0:
-            zero = scene_tokens.sum() * 0.0
-            return dict(loss_cf_rel=zero, loss_cf_speed=zero, loss_cf_path=zero)
+        ego_aug_all, aug_meta = (None, None)
+        if self.train_candidate_augmentation and self.aug_num_candidates > 0:
+            ego_aug_all, aug_meta = self._build_augmented_ego_candidates(ego_gt)
 
-        # Factual supervision only: labels come from observed ego and observed
-        # agent futures. No counterfactual ground-truth futures are assumed.
-        relevance_label = interaction_relevance_labels(ego_gt, agent_gt_abs)
-        speed_label = speed_pseudo_labels(agent_gt)
-        path_label = path_pseudo_labels(agent_gt)
+        for b in range(batch_size):
+            attrs = attr_samples[b].to(device=device)
+            gt_labels = label_samples[b].to(device=device, dtype=torch.long)
+            gt_boxes = self._extract_bbox_tensor(box_samples[b], device, 1).squeeze(0).to(dtype=dtype)
+            n = min(attrs.shape[0], gt_labels.shape[0], gt_boxes.shape[0])
+            if n == 0:
+                continue
+            attrs = attrs[:n]
+            gt_labels = gt_labels[:n]
+            gt_boxes = gt_boxes[:n]
 
-        features = self.graph(scene_tokens, ego_gt, agent_gt_abs, boxes=boxes, labels=gt_labels_3d)
-        pred = self.predictor(features)
-        valid = torch.ones_like(relevance_label, dtype=torch.bool)
-        loss_rel = F.binary_cross_entropy_with_logits(pred["relevance_logits"][valid], relevance_label[valid])
-        loss_speed = F.cross_entropy(pred["speed_logits"][valid], speed_label[valid])
-        loss_path = F.cross_entropy(pred["path_logits"][valid], path_label[valid])
+            future_offsets = attrs[:, : self.future_steps * 2].reshape(n, self.future_steps, 2)
+            future_mask = attrs[:, self.future_steps * 2 : self.future_steps * 3]
+            valid = future_mask.sum(dim=-1) >= self.min_valid_future_steps
+            if self.valid_agent_labels is not None:
+                dynamic = torch.zeros_like(valid, dtype=torch.bool)
+                for label in self.valid_agent_labels:
+                    dynamic |= gt_labels == label
+                valid &= dynamic
+            valid_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+            if valid_idx.numel() == 0:
+                continue
+
+            agent_rel = future_offsets[valid_idx].to(dtype=dtype).cumsum(dim=-2).unsqueeze(0)
+            labels_compact = gt_labels[valid_idx].unsqueeze(0)
+            boxes_compact = gt_boxes[valid_idx]
+            if boxes_compact.shape[-1] < 4:
+                boxes_compact = torch.cat(
+                    [boxes_compact, boxes_compact.new_zeros((boxes_compact.shape[0], 4 - boxes_compact.shape[-1]))],
+                    dim=-1,
+                )
+            boxes_compact = boxes_compact[:, :4].unsqueeze(0)
+            origins = boxes_compact[..., :2]
+            agent_abs = agent_rel + origins[..., None, :]
+            ego_b = ego_gt[b : b + 1]
+            scene_b = scene_tokens[b : b + 1]
+
+            relevance_target = interaction_relevance_labels(ego_b, agent_abs)
+            speed_target = speed_pseudo_labels(agent_rel)
+            path_target = path_pseudo_labels(agent_rel)
+            factual_meta = self._factual_meta_ids(ego_b) if self.use_ego_meta_embedding else None
+            features = self.graph(
+                scene_b,
+                ego_b,
+                agent_abs,
+                boxes=boxes_compact,
+                labels=labels_compact,
+                ego_meta=factual_meta,
+            )
+            pred = self.predictor(features)
+            rel_sum = rel_sum + F.binary_cross_entropy_with_logits(
+                pred["relevance_logits"], relevance_target, reduction="sum"
+            )
+            speed_sum = speed_sum + F.cross_entropy(
+                pred["speed_logits"].reshape(-1, pred["speed_logits"].shape[-1]),
+                speed_target.reshape(-1),
+                reduction="sum",
+            )
+            path_sum = path_sum + F.cross_entropy(
+                pred["path_logits"].reshape(-1, pred["path_logits"].shape[-1]),
+                path_target.reshape(-1),
+                reduction="sum",
+            )
+            factual_count += int(valid_idx.numel())
+
+            if self.real_loss_weight > 0:
+                realized = self.realizer(
+                    agent_abs,
+                    speed_target,
+                    path_target,
+                    relevance_target,
+                    threshold=self.relevance_threshold,
+                    start_positions=origins,
+                )
+                real_sum = real_sum + F.l1_loss(realized, agent_abs, reduction="sum")
+                real_value_count += agent_abs.numel()
+
+            if ego_aug_all is not None:
+                ego_aug_b = ego_aug_all[b]
+                num_aug = ego_aug_b.shape[0]
+                scene_rep = scene_b.expand(num_aug, *scene_b.shape[1:])
+                agent_rep = agent_abs.expand(num_aug, *agent_abs.shape[1:])
+                boxes_rep = boxes_compact.expand(num_aug, *boxes_compact.shape[1:])
+                labels_rep = labels_compact.expand(num_aug, *labels_compact.shape[1:])
+                meta_rep = aug_meta if self.use_ego_meta_embedding else None
+                aug_rel = interaction_relevance_labels(ego_aug_b, agent_rep)
+                aug_speed = speed_target.expand(num_aug, -1)
+                aug_path = path_target.expand(num_aug, -1)
+                aug_features = self.graph(
+                    scene_rep,
+                    ego_aug_b,
+                    agent_rep,
+                    boxes=boxes_rep,
+                    labels=labels_rep,
+                    ego_meta=meta_rep,
+                )
+                aug_pred = self.predictor(aug_features)
+                aug_rel_sum = aug_rel_sum + F.binary_cross_entropy_with_logits(
+                    aug_pred["relevance_logits"], aug_rel, reduction="sum"
+                )
+                if self.aug_response_loss_weight > 0:
+                    aug_speed_sum = aug_speed_sum + F.cross_entropy(
+                        aug_pred["speed_logits"].reshape(-1, aug_pred["speed_logits"].shape[-1]),
+                        aug_speed.reshape(-1),
+                        reduction="sum",
+                    )
+                    aug_path_sum = aug_path_sum + F.cross_entropy(
+                        aug_pred["path_logits"].reshape(-1, aug_pred["path_logits"].shape[-1]),
+                        aug_path.reshape(-1),
+                        reduction="sum",
+                    )
+                aug_count += int(valid_idx.numel()) * num_aug
+
+        denom = max(factual_count, 1)
         losses = dict(
-            loss_cf_rel=loss_rel * self.rel_loss_weight,
-            loss_cf_speed=loss_speed * self.speed_loss_weight,
-            loss_cf_path=loss_path * self.path_loss_weight,
+            loss_cf_rel=(rel_sum / denom) * self.rel_loss_weight,
+            loss_cf_speed=(speed_sum / denom) * self.speed_loss_weight,
+            loss_cf_path=(path_sum / denom) * self.path_loss_weight,
         )
         if self.real_loss_weight > 0:
-            relevance = relevance_label
-            realized = self.realizer(
-                agent_gt_abs,
-                speed_label,
-                path_label,
-                relevance,
-                threshold=self.relevance_threshold,
-                start_positions=agent_origins,
-            )
-            losses["loss_cf_real"] = F.l1_loss(realized[valid], agent_gt_abs[valid]) * self.real_loss_weight
+            losses["loss_cf_real"] = (real_sum / max(real_value_count, 1)) * self.real_loss_weight
+        if ego_aug_all is not None:
+            aug_denom = max(aug_count, 1)
+            losses["loss_cf_aug_rel"] = (aug_rel_sum / aug_denom) * self.aug_loss_weight
+            if self.aug_response_loss_weight > 0:
+                response_weight = self.aug_loss_weight * self.aug_response_loss_weight
+                losses["loss_cf_aug_speed"] = (aug_speed_sum / aug_denom) * response_weight
+                losses["loss_cf_aug_path"] = (aug_path_sum / aug_denom) * response_weight
         return losses
 
     @torch.no_grad()
@@ -261,6 +479,9 @@ class CounterfactualReasoningHead(nn.Module):
         base_agents = self._extract_base_agent_futures(
             bbox_result=bbox_result, boxes=boxes, device=device, batch_size=batch_size
         ).to(dtype=dtype)
+        agent_valid_mask = self._extract_agent_valid_mask(
+            bbox_result, base_agents.shape[1], device, batch_size
+        )
         agent_origins = self._box_centers_for_agents(boxes, base_agents.shape[1], device, dtype) if boxes is not None else None
         base_ego_anchor = None
         lane0 = lane_results[0] if isinstance(lane_results, (list, tuple)) and len(lane_results) > 0 else lane_results
@@ -278,7 +499,11 @@ class CounterfactualReasoningHead(nn.Module):
 
         if ego_candidates is None:
             ego_candidates, candidate_meta_actions = self.ego_generator(batch_size, device, dtype=scene_tokens.dtype)
-            if base_ego_anchor is not None:
+            # The legacy all-combinations fallback keeps MindDrive's base plan
+            # as candidate 0.  The paper Rule-K=7 ablation already contains
+            # exactly seven speed-conditioned candidates, so prepending the
+            # base plan would make an unfair K=8 comparison.
+            if base_ego_anchor is not None and self.rule_candidate_mode == "all":
                 ego_candidates = torch.cat([base_ego_anchor[:, None], ego_candidates], dim=1)
                 candidate_meta_actions = [
                     dict(speed="minddrive selected", path="minddrive selected", speed_idx=-1, path_idx=-1)
@@ -292,30 +517,99 @@ class CounterfactualReasoningHead(nn.Module):
         if base_ego_anchor is None:
             base_ego_anchor = ego_candidates[:, 0]
 
+        # MindDrive's simple_test_pts currently runs with B=1. Compacting the
+        # decoded agents before graph construction avoids padding invalid
+        # queries back into agent-agent message passing. A batched inference
+        # implementation needs per-sample packing because valid counts differ.
+        if batch_size != 1:
+            raise NotImplementedError(
+                "Compact counterfactual inference currently requires batch_size=1; got {}.".format(batch_size)
+            )
+        valid_idx = torch.nonzero(agent_valid_mask[0], as_tuple=False).squeeze(-1)
+        valid_base_agents = base_agents[:, valid_idx]
+        valid_boxes = boxes[:, valid_idx] if boxes is not None else None
+        valid_agent_origins = agent_origins[:, valid_idx] if agent_origins is not None else None
+        num_agents = base_agents.shape[1]
+
         risk_terms = []
         scenes = []
         relevance_all = []
         response_actions = []
         for k in range(ego_candidates.shape[1]):
             ego_k = ego_candidates[:, k]
-            features = self.graph(scene_tokens, ego_k, base_agents, boxes=boxes, map_context=map_context)
-            pred = self.predictor(features)
-            relevance = torch.sigmoid(pred["relevance_logits"])
-            speed_labels = pred["speed_logits"].argmax(dim=-1)
-            path_labels = pred["path_logits"].argmax(dim=-1)
-            realized_agents = self.realizer(
-                base_agents,
-                speed_labels,
-                path_labels,
-                relevance,
-                threshold=self.relevance_threshold,
-                start_positions=agent_origins,
+            ego_meta = None
+            if self.use_ego_meta_embedding:
+                ego_meta = self._meta_tensor_from_actions(candidate_meta_actions, ego_candidates.shape[1], batch_size, device)[
+                    k * batch_size : (k + 1) * batch_size
+                ]
+            if valid_idx.numel() > 0:
+                features = self.graph(
+                    scene_tokens,
+                    ego_k,
+                    valid_base_agents,
+                    boxes=valid_boxes,
+                    map_context=map_context,
+                    ego_meta=ego_meta,
+                )
+                pred = self.predictor(features)
+                valid_relevance = torch.sigmoid(pred["relevance_logits"])
+                valid_speed_probs = pred["speed_logits"].softmax(dim=-1)
+                valid_path_probs = pred["path_logits"].softmax(dim=-1)
+                valid_speed_labels = pred["speed_logits"].argmax(dim=-1)
+                valid_path_labels = pred["path_logits"].argmax(dim=-1)
+                if self.use_candidate_conditioned_agent_response:
+                    valid_realized_agents = self.realizer(
+                        valid_base_agents,
+                        valid_speed_labels,
+                        valid_path_labels,
+                        valid_relevance,
+                        threshold=self.relevance_threshold,
+                        start_positions=valid_agent_origins,
+                    )
+                else:
+                    # A2 paper ablation: every candidate is evaluated against
+                    # the same original MindDrive agent futures.
+                    valid_realized_agents = valid_base_agents
+            else:
+                valid_relevance = base_agents.new_zeros((batch_size, 0))
+                valid_speed_probs = base_agents.new_zeros((batch_size, 0, len(SPEED_META_ACTIONS)))
+                valid_path_probs = base_agents.new_zeros((batch_size, 0, len(PATH_META_ACTIONS)))
+                valid_speed_labels = torch.empty((batch_size, 0), device=device, dtype=torch.long)
+                valid_path_labels = torch.empty((batch_size, 0), device=device, dtype=torch.long)
+                valid_realized_agents = valid_base_agents
+
+            risk = self.risk_scorer(
+                ego_k,
+                valid_realized_agents,
+                base_ego_future=base_ego_anchor,
+                relevance=valid_relevance,
+                map_context=map_context,
             )
-            risk = self.risk_scorer(ego_k, realized_agents, base_ego_future=base_ego_anchor, relevance=relevance, map_context=map_context)
+
+            # Preserve the decoded bbox ordering expected by result consumers.
+            relevance = base_agents.new_zeros((batch_size, num_agents))
+            speed_probs = base_agents.new_zeros((batch_size, num_agents, len(SPEED_META_ACTIONS)))
+            path_probs = base_agents.new_zeros((batch_size, num_agents, len(PATH_META_ACTIONS)))
+            speed_labels = torch.full((batch_size, num_agents), -1, device=device, dtype=torch.long)
+            path_labels = torch.full((batch_size, num_agents), -1, device=device, dtype=torch.long)
+            realized_agents = base_agents.clone()
+            relevance[:, valid_idx] = valid_relevance
+            speed_probs[:, valid_idx] = valid_speed_probs
+            path_probs[:, valid_idx] = valid_path_probs
+            speed_labels[:, valid_idx] = valid_speed_labels
+            path_labels[:, valid_idx] = valid_path_labels
+            realized_agents[:, valid_idx] = valid_realized_agents
             risk_terms.append(risk)
             scenes.append(dict(ego_future=ego_k.detach().cpu(), agent_futures=realized_agents.detach().cpu()))
             relevance_all.append(relevance.detach().cpu())
-            response_actions.append(dict(speed=speed_labels.detach().cpu(), path=path_labels.detach().cpu()))
+            response_actions.append(
+                dict(
+                    speed=speed_labels.detach().cpu(),
+                    path=path_labels.detach().cpu(),
+                    speed_probs=speed_probs.detach().cpu(),
+                    path_probs=path_probs.detach().cpu(),
+                )
+            )
 
         total = torch.stack([r["total"] for r in risk_terms], dim=1)
         selected_idx = total.argmin(dim=1)
@@ -327,11 +621,18 @@ class CounterfactualReasoningHead(nn.Module):
         selected_meta = []
         for b, idx in enumerate(selected_idx.detach().cpu().tolist()):
             selected_meta.append(candidate_meta_actions[idx])
-        return dict(
+        output = dict(
             selected_ego_future=selected.detach().cpu(),
             selected_meta_action=selected_meta[0] if len(selected_meta) == 1 else selected_meta,
+            candidate_meta_actions=candidate_meta_actions,
             risk_scores=risk_scores,
-            counterfactual_scenes=scenes,
             interaction_relevance=relevance_all,
             response_meta_actions=response_actions,
+            use_candidate_conditioned_agent_response=self.use_candidate_conditioned_agent_response,
+            rule_candidate_mode=self.rule_candidate_mode,
+            agent_valid_mask=agent_valid_mask.detach().cpu(),
+            num_valid_agents=agent_valid_mask.sum(dim=-1).detach().cpu(),
         )
+        if self.save_counterfactual_scenes:
+            output["counterfactual_scenes"] = scenes
+        return output

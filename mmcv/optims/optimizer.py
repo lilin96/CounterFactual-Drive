@@ -57,6 +57,7 @@ def build_optimizer(model, cfg: Dict):
 
 # TORCH_OPTIMIZERS = register_torch_optimizers()
 
+@OPTIMIZER_BUILDERS.register_module()
 class DefaultOptimizerConstructor:
     """Default constructor for optimizers.
 

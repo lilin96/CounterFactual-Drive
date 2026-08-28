@@ -20,7 +20,15 @@ class RuleBasedRiskScorer(nn.Module):
         self.near_distance = near_distance
         self.dt = dt
 
-    def forward(self, ego_future, agent_futures, base_ego_future=None, relevance=None, map_context=None):
+    def forward(
+        self,
+        ego_future,
+        agent_futures,
+        base_ego_future=None,
+        relevance=None,
+        map_context=None,
+        agent_valid_mask=None,
+    ):
         if agent_futures.numel() == 0:
             b = ego_future.shape[0]
             zeros = ego_future.new_zeros(b)
@@ -41,6 +49,11 @@ class RuleBasedRiskScorer(nn.Module):
         ego = ego_future[:, None, :t, :]
         agents = agent_futures[:, :, :t, :]
         dist = torch.linalg.norm(agents - ego, dim=-1)
+        valid = None
+        if agent_valid_mask is not None:
+            valid = agent_valid_mask.to(device=dist.device, dtype=torch.bool)
+            valid = valid[:, : agents.shape[1]]
+            dist = dist.masked_fill(~valid[..., None], float("inf"))
         min_dist = dist.min(dim=-1).values
         collision = torch.relu(self.collision_distance - min_dist).sum(dim=-1)
         near = torch.relu(self.near_distance - min_dist).sum(dim=-1)
@@ -67,7 +80,13 @@ class RuleBasedRiskScorer(nn.Module):
             nominal = torch.linalg.norm(ego_future - base_ego_future[:, : ego_future.shape[-2]], dim=-1).mean(dim=-1)
         interaction = near
         if relevance is not None and relevance.numel() > 0:
-            interaction = interaction * (1.0 + relevance.mean(dim=-1))
+            if valid is None:
+                mean_relevance = relevance.mean(dim=-1)
+            else:
+                valid_weight = valid.to(dtype=relevance.dtype)
+                mean_relevance = (relevance[:, : valid.shape[1]] * valid_weight).sum(dim=-1)
+                mean_relevance = mean_relevance / valid_weight.sum(dim=-1).clamp_min(1.0)
+            interaction = interaction * (1.0 + mean_relevance)
         lateral = ego_future[..., 0].abs()
         max_lateral = lateral.max(dim=-1).values
         final_lateral = lateral[..., -1]

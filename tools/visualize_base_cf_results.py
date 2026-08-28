@@ -9,7 +9,6 @@ Example:
 """
 
 import argparse
-import io
 import os
 
 import matplotlib
@@ -18,10 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.storage
 from mmcv.fileio.io import load
-
-torch.storage._load_from_bytes = lambda b: torch.load(io.BytesIO(b), map_location="cpu", weights_only=False)
 
 
 SPEED_NAMES = [

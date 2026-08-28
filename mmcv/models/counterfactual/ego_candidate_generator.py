@@ -9,13 +9,30 @@ from .meta_action_labels import PATH_META_ACTIONS, SPEED_META_ACTIONS, default_m
 class EgoCandidateGenerator(nn.Module):
     """Generate lightweight ego candidates when Action Expert candidates are absent."""
 
-    def __init__(self, future_steps=6, dt=0.5):
+    def __init__(self, future_steps=6, dt=0.5, candidate_mode="all", fixed_path_idx=1):
         super().__init__()
         self.future_steps = future_steps
         self.dt = dt
+        self.candidate_mode = candidate_mode
+        self.fixed_path_idx = int(fixed_path_idx)
 
     def forward(self, batch_size, device, dtype=torch.float32):
-        actions = default_meta_actions(device=device)
+        if self.candidate_mode == "all":
+            actions = default_meta_actions(device=device)
+        elif self.candidate_mode == "speed_only":
+            path_idx = max(0, min(self.fixed_path_idx, len(PATH_META_ACTIONS) - 1))
+            actions = [
+                dict(
+                    speed=speed,
+                    path=PATH_META_ACTIONS[path_idx],
+                    speed_idx=speed_idx,
+                    path_idx=path_idx,
+                    source="counterfactual_rule_speed_only",
+                )
+                for speed_idx, speed in enumerate(SPEED_META_ACTIONS)
+            ]
+        else:
+            raise ValueError("Unsupported rule candidate_mode: {}".format(self.candidate_mode))
         trajs = []
         t = torch.arange(1, self.future_steps + 1, device=device, dtype=dtype) * self.dt
         for action in actions:

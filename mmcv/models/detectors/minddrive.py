@@ -938,6 +938,8 @@ class Minddrive(MVXTwoStageDetector):
     
         generated_text = []
         metric_dict = {}
+        cf_ego_candidates = None
+        cf_candidate_meta_actions = None
 
         if not (self.fp16_infer or self.fp32_infer) or self.fp16_eval :
             gt_attr_label = data['gt_attr_labels'][0].to('cpu')
@@ -1163,6 +1165,28 @@ class Minddrive(MVXTwoStageDetector):
                         cmd_path = self.command2hot(path_value, max_dim=6)
                         lat_onehot = torch.tensor(cmd_speed).unsqueeze(0)
                         lon_onehot = torch.tensor(cmd_path).unsqueeze(0)
+                        if os.getenv("MINDDRIVE_CF_USE_ACTION_EXPERT_CANDIDATES", "0") == "1":
+                            cf_ego_candidates = torch.nan_to_num(
+                                ego_fut_preds.to(torch.float32).cumsum(dim=-2)
+                            )
+                            inv_path_mapping = {v: k for k, v in self.PA_MAPPING.items()}
+                            path_token = inv_path_mapping.get(path_value, str(path_command))
+                            path_name = path_token.strip("<>").replace("_", " ")
+                            cf_candidate_meta_actions = []
+                            for speed_idx in range(cf_ego_candidates.shape[1]):
+                                speed_token = SPEED_MAPPING.get(speed_idx, "<unknown_speed_{}>".format(speed_idx))
+                                speed_name = speed_token.strip("<>").replace("_", " ")
+                                cf_candidate_meta_actions.append(
+                                    dict(
+                                        speed=speed_name,
+                                        path=path_name,
+                                        speed_token=speed_token,
+                                        path_token=path_token,
+                                        speed_idx=speed_idx,
+                                        path_idx=path_value,
+                                        source="minddrive_action_expert",
+                                    )
+                                )
                         if self.is_decoupling:
                             mask_active_cmd = lat_onehot == 1
                             pw_mask_active_cmd = lon_onehot == 1
@@ -1292,26 +1316,82 @@ class Minddrive(MVXTwoStageDetector):
 
         if self.counterfactual_head is not None and lane_results is not None and len(bbox_results) > 0 and "vision_embeded_obj" in locals() and "vision_embeded_map" in locals():
             scene_tokens = torch.cat([vision_embeded_obj, vision_embeded_map], dim=1)
+            use_action_expert_candidates = (
+                os.getenv("MINDDRIVE_CF_USE_ACTION_EXPERT_CANDIDATES", "0") == "1"
+                and cf_ego_candidates is not None
+            )
             cf_output = self.counterfactual_head.forward_infer(
                 scene_tokens=scene_tokens,
                 bbox_result=bbox_results[0],
                 lane_results=lane_results,
-                ego_candidates=None,
-                candidate_meta_actions=None,
+                ego_candidates=cf_ego_candidates if use_action_expert_candidates else None,
+                candidate_meta_actions=cf_candidate_meta_actions if use_action_expert_candidates else None,
                 map_context=lane_results,
             )
             lane_results[0]["cf_selected_ego_future"] = cf_output["selected_ego_future"]
             lane_results[0]["cf_selected_meta_action"] = cf_output["selected_meta_action"]
+            lane_results[0]["cf_candidate_meta_actions"] = cf_output.get("candidate_meta_actions", None)
             lane_results[0]["cf_risk_scores"] = cf_output["risk_scores"]
-            lane_results[0]["cf_counterfactual_scenes"] = cf_output["counterfactual_scenes"]
+            lane_results[0]["cf_ego_candidate_source"] = (
+                "minddrive_action_expert" if use_action_expert_candidates else "counterfactual_rule_fallback"
+            )
+            if "counterfactual_scenes" in cf_output:
+                lane_results[0]["cf_counterfactual_scenes"] = cf_output["counterfactual_scenes"]
             lane_results[0]["cf_interaction_relevance"] = cf_output["interaction_relevance"]
             lane_results[0]["cf_response_meta_actions"] = cf_output["response_meta_actions"]
+            lane_results[0]["cf_agent_valid_mask"] = cf_output.get("agent_valid_mask", None)
+            lane_results[0]["cf_num_valid_agents"] = cf_output.get("num_valid_agents", None)
+            lane_results[0]["cf_use_candidate_conditioned_agent_response"] = cf_output.get(
+                "use_candidate_conditioned_agent_response", None
+            )
+            lane_results[0]["cf_rule_candidate_mode"] = cf_output.get("rule_candidate_mode", None)
             bbox_results[0]["cf_selected_ego_future"] = cf_output["selected_ego_future"]
             bbox_results[0]["cf_selected_meta_action"] = cf_output["selected_meta_action"]
+            bbox_results[0]["cf_candidate_meta_actions"] = cf_output.get("candidate_meta_actions", None)
             bbox_results[0]["cf_risk_scores"] = cf_output["risk_scores"]
-            bbox_results[0]["cf_counterfactual_scenes"] = cf_output["counterfactual_scenes"]
+            bbox_results[0]["cf_ego_candidate_source"] = lane_results[0]["cf_ego_candidate_source"]
+            if "counterfactual_scenes" in cf_output:
+                bbox_results[0]["cf_counterfactual_scenes"] = cf_output["counterfactual_scenes"]
             bbox_results[0]["cf_interaction_relevance"] = cf_output["interaction_relevance"]
             bbox_results[0]["cf_response_meta_actions"] = cf_output["response_meta_actions"]
+            bbox_results[0]["cf_agent_valid_mask"] = cf_output.get("agent_valid_mask", None)
+            bbox_results[0]["cf_num_valid_agents"] = cf_output.get("num_valid_agents", None)
+            bbox_results[0]["cf_use_candidate_conditioned_agent_response"] = cf_output.get(
+                "use_candidate_conditioned_agent_response", None
+            )
+            bbox_results[0]["cf_rule_candidate_mode"] = cf_output.get("rule_candidate_mode", None)
+            replace_decision = (
+                os.getenv("MINDDRIVE_CF_REPLACE_DECISION", "0") == "1"
+                and use_action_expert_candidates
+            )
+            if replace_decision:
+                selected_ego = cf_output["selected_ego_future"]
+                if selected_ego.dim() == 3:
+                    selected_ego = selected_ego[0]
+                selected_ego = torch.nan_to_num(selected_ego.to(torch.float32))
+                lane_results[0]["decision_expert_ego_fut_preds"] = lane_results[0].get("ego_fut_preds", None)
+                bbox_results[0]["decision_expert_ego_fut_preds"] = bbox_results[0].get("ego_fut_preds", None)
+                lane_results[0]["ego_fut_preds"] = selected_ego
+                bbox_results[0]["ego_fut_preds"] = selected_ego
+                lane_results[0]["cf_replaced_decision_expert"] = True
+                bbox_results[0]["cf_replaced_decision_expert"] = True
+                selected_meta = cf_output.get("selected_meta_action", {})
+                if isinstance(selected_meta, dict) and "speed_idx" in selected_meta:
+                    lane_results[0]["decision_expert_speed_value"] = lane_results[0].get("speed_value", None)
+                    bbox_results[0]["decision_expert_speed_value"] = bbox_results[0].get("speed_value", None)
+                    lane_results[0]["speed_value"] = int(selected_meta["speed_idx"])
+                    bbox_results[0]["speed_value"] = int(selected_meta["speed_idx"])
+                if "gt_attr_label" in locals() and "gt_bbox" in locals() and "fut_valid_flag" in locals() and "ego_fut_trajs" in data:
+                    gt_ego_fut_trajs = data["ego_fut_trajs"][0, 0].cumsum(dim=-2)
+                    cf_metric_dict = self.compute_planner_metric_stp3(
+                        pred_ego_fut_trajs=selected_ego[None].to("cpu"),
+                        gt_ego_fut_trajs=gt_ego_fut_trajs[None].to("cpu"),
+                        gt_agent_boxes=gt_bbox,
+                        gt_agent_feats=gt_attr_label.unsqueeze(0),
+                        fut_valid_flag=fut_valid_flag,
+                    )
+                    metric_dict.update(cf_metric_dict)
+                metric_dict["cf_replace_decision"] = 1.0
 
         return bbox_results, generated_text, lane_results, metric_dict
     

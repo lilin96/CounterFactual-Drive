@@ -34,7 +34,7 @@ import sys
 sys.path.append('')
 
 import subprocess
-def print_trainable_and_untrainable_params(model):
+def print_trainable_and_untrainable_params(model, logger=None):
     """
     打印模型中所有训练的参数模型名称和不训练的参数模型名称。
     
@@ -43,12 +43,29 @@ def print_trainable_and_untrainable_params(model):
     """
     trainable_params = []
     untrainable_params = []
+    trainable_numel = 0
+    untrainable_numel = 0
 
     for name, param in model.named_parameters():
         if param.requires_grad:
             trainable_params.append(name)
+            trainable_numel += param.numel()
         else:
             untrainable_params.append(name)
+            untrainable_numel += param.numel()
+
+    summary = (
+        f"Parameter summary: trainable={len(trainable_params)} tensors "
+        f"({trainable_numel:,} params), frozen={len(untrainable_params)} tensors "
+        f"({untrainable_numel:,} params)"
+    )
+    if logger is not None:
+        logger.info(summary)
+    else:
+        print(summary)
+
+    if os.environ.get('MINDDRIVE_PRINT_PARAM_NAMES', '0') != '1':
+        return
 
     print("训练的参数模型名称:")
     for param_name in trainable_params:
@@ -260,8 +277,11 @@ def main():
         logger.info(f"Trainable parameters count: {len(trainable_params)}")
 
 
-    logger.info(f'Model:\n{model}')
-    print_trainable_and_untrainable_params(model)    
+    if os.environ.get('MINDDRIVE_LOG_FULL_MODEL', '0') == '1':
+        logger.info(f'Model:\n{model}')
+    else:
+        logger.info(f'Model class: {model.__class__.__name__}')
+    print_trainable_and_untrainable_params(model, logger=logger)
     datasets = []
 
     if args.rollout_data is not None:

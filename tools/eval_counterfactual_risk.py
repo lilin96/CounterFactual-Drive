@@ -18,18 +18,13 @@ Example:
 
 import argparse
 import csv
-import io
 import json
 import os
 from collections import Counter
 
 import numpy as np
 import torch
-import torch.storage
 from mmcv.fileio.io import load
-
-
-torch.storage._load_from_bytes = lambda b: torch.load(io.BytesIO(b), map_location="cpu", weights_only=False)
 
 
 RISK_TERMS = ["collision", "ttc", "interaction", "map_rule", "comfort", "progress", "nominal", "total"]
